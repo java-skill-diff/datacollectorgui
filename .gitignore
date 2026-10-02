@@ -1,0 +1,13 @@
+/.DS_Store
+/.vscode
+/__pycache__
+/convertedfile.py
+/datacollecter_actual.py
+/datacollector+logger.py
+/gas
+/loggertoscript.html
+/pressurevisa
+/pyvisars485.py
+/taker.py
+/test
+/tocsv.py
