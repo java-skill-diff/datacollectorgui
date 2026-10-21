@@ -8,6 +8,7 @@ from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 
 import serial
+from serial.tools import list_ports
 import pyvisa
 import nidaqmx
 import nidaqmx.constants
@@ -22,6 +23,14 @@ COMMAND_PRESSURE = "#01RD\r" #01 (ID) ReaD \r (carraige return)
 COMMAND_RFPOWER = "Q\r"
 COMMAND_SETTOSERIAL = "***\r" #Set Seren R301 to serial mode for reading forward and reflected power
 COMMAND_STOP = "S\r"
+
+PRESSURE_PORT = 'COM2'
+RF_PORT = 'COM4'
+CAMERA_PORT = None #Arduino camera trigger (camera_trigger.ino); None = auto-detect, or set e.g. 'COM5'
+CAMERA_BAUD = 115200
+CAMERA_READY_TIMEOUT_S = 3.0 #the Arduino resets when the port opens; bootloader + setup() takes ~2 s
+COMMAND_CAMERA_TRIGGER = "T\r" #fire the camera trigger (only fires once until re-armed)
+COMMAND_CAMERA_RESET = "R\r" #re-arm the camera trigger
 
 #(csv column, label, unit, display format) - order is the CSV column order
 PARAMETERS = [
@@ -53,6 +62,17 @@ def default_file_name():
     return f"voltage_pressure_run_{int(time())}"
 
 
+def find_camera_port():
+    #first port that looks like an Arduino, skipping the ports used by the other instruments
+    for p in list_ports.comports():
+        if p.device in (PRESSURE_PORT, RF_PORT):
+            continue
+        desc = f"{p.device} {p.description} {p.manufacturer or ''}".lower()
+        if any(k in desc for k in ("usbmodem", "usbserial", "arduino", "ch340", "wch")):
+            return p.device
+    return None
+
+
 def quietly(fn):
     #run a cleanup step, ignoring failures so the remaining steps still run
     try:
@@ -68,20 +88,71 @@ class Instruments:
         self.ser_rfpower = None
         self.rmpyvisa = None
         self.voltage_meter = None
+        self.ser_camera = None
 
-    def open(self):
+    def open(self, log):
         #open nidaqmx analog channels
         self.task = nidaqmx.task.Task()
         self.task.ai_channels.add_ai_voltage_chan("Dev1/ai0", terminal_config=nidaqmx.constants.TerminalConfiguration.RSE)
 
         #Open serial to rough pressure sensor and Seren R301 RF generator
-        self.ser_pressure = serial.Serial('COM2', baudrate=1200, bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE, timeout=0.15)
-        self.ser_rfpower = serial.Serial('COM4', baudrate=19200, bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE, timeout=0.15)
+        self.ser_pressure = serial.Serial(PRESSURE_PORT, baudrate=1200, bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE, timeout=0.15)
+        self.ser_rfpower = serial.Serial(RF_PORT, baudrate=19200, bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE, timeout=0.15)
         self.ser_rfpower.write(COMMAND_SETTOSERIAL.encode('utf-8'))
 
         #Open pyvisa to Agilent 34401A voltmeter
         self.rmpyvisa = pyvisa.ResourceManager()
         self.voltage_meter = self.rmpyvisa.open_resource('USB0::0x0957::0x1A07::MY53201512::INSTR')
+
+        self.open_camera(log)
+
+    def open_camera(self, log):
+        #the camera trigger is optional: if it can't be opened, data collection still runs without it
+        port = CAMERA_PORT or find_camera_port()
+        if port is None:
+            log("WARNING: Camera trigger not found, recording without camera sync. Set CAMERA_PORT if it is connected.")
+            return
+        try:
+            self.ser_camera = serial.Serial(port, CAMERA_BAUD, timeout=0.1)
+        except serial.SerialException as e:
+            log(f"WARNING: Could not open camera trigger on {port}, recording without camera sync. Code: {e}")
+            return
+        deadline = now_s() + CAMERA_READY_TIMEOUT_S
+        while now_s() < deadline:
+            if self.ser_camera.readline().strip() == b"READY":
+                break
+        else:
+            log(f"WARNING: No READY from camera trigger on {port}; continuing anyway.")
+        self.ser_camera.reset_input_buffer()
+        log(f"Camera trigger connected on {port}")
+
+    def trigger_camera(self, log):
+        #returns True if the trigger command was sent; the reply is checked later by camera_reply() so the first sample isn't delayed
+        if self.ser_camera is None:
+            return False
+        try:
+            self.ser_camera.reset_input_buffer()
+            self.ser_camera.write(COMMAND_CAMERA_TRIGGER.encode('utf-8'))
+            return True
+        except serial.SerialException as e:
+            log(f"WARNING: Camera trigger failed. Code: {e}")
+            return False
+
+    def camera_reply(self):
+        try:
+            return self.ser_camera.readline().decode('utf-8', errors='replace').strip()
+        except serial.SerialException as e:
+            return f"error: {e}"
+
+    def reset_camera(self, log):
+        if self.ser_camera is None:
+            return
+        try:
+            self.ser_camera.write(COMMAND_CAMERA_RESET.encode('utf-8'))
+            self.ser_camera.flush() #make sure R is sent before the port is closed
+            log("Camera trigger reset")
+        except serial.SerialException as e:
+            log(f"WARNING: Camera trigger reset failed. Code: {e}")
 
     def close(self):
         #only close what was actually opened, so a failed open() still cleans up
@@ -94,6 +165,8 @@ class Instruments:
             quietly(self.ser_pressure.close)
         if self.rmpyvisa is not None:
             quietly(self.rmpyvisa.close)
+        if self.ser_camera is not None:
+            quietly(self.ser_camera.close)
 
     def read(self, log):
         #DAQ and voltmeter failures raise and stop acquisition; pressure/RF failures are logged and recorded as "NA"
@@ -141,11 +214,14 @@ class Instruments:
 class Acquisition(threading.Thread):
     #Runs the sampling loop off the GUI thread. Talks to the GUI only through queues, since tkinter isn't thread-safe:
     #  commands (GUI -> worker): ("record", path), ("stop_record", None)
-    #  events (worker -> GUI): ("log", msg), ("connected", None), ("sample", dict), ("recording", path or None), ("stopped", None)
+    #  events (worker -> GUI): ("log", msg), ("connected", None), ("sample", dict), ("recording", path or None),
+    #                          ("camera_triggered", None), ("stopped", None)
 
-    def __init__(self, events):
+    def __init__(self, events, trigger_camera):
         super().__init__(daemon=True)
         self.events = events
+        self.trigger_camera = trigger_camera #send T at the first sample of the next recording (the camera is only triggered once per program run)
+        self.instruments = Instruments()
         self.commands = queue.Queue()
         self.stop_event = threading.Event()
         self.csv_file = None
@@ -155,21 +231,32 @@ class Acquisition(threading.Thread):
         self.events.put(("log", msg))
 
     def run(self):
-        instruments = Instruments()
+        instruments = self.instruments
         try:
-            instruments.open()
+            instruments.open(self.log)
             self.events.put(("connected", None))
 
             acquisition_start = now_s()
             i = 0
+            camera_sent = False
             while not self.stop_event.is_set():
                 if self.handle_commands(): #recording just started: restart the clock so the CSV starts at t=0
+                    if self.trigger_camera:
+                        camera_sent = instruments.trigger_camera(self.log) #sent right before t=0 so the video lines up with the first datapoint
                     acquisition_start = now_s()
                     i = 0
                 elapsed_s = now_s() - acquisition_start
 
                 sample = instruments.read(self.log)
                 sample["time_s"] = elapsed_s
+
+                if camera_sent: #check the trigger's reply now that the first sample is taken
+                    camera_sent = False
+                    self.trigger_camera = False
+                    reply = instruments.camera_reply()
+                    if reply != "OK":
+                        self.log(f"WARNING: Unexpected reply from camera trigger: {reply!r}")
+                    self.events.put(("camera_triggered", None))
 
                 if self.csv_writer is not None:
                     self.csv_writer.writerow([f"{elapsed_s:.4f}"] + [sample[key] for key in CSV_HEADER[1:]])
@@ -181,7 +268,7 @@ class Acquisition(threading.Thread):
         except Exception as e:
             self.log(f"WARNING: Unable to read from devices, acquisition stopped. Check connection to devices. Code: {e}")
         finally:
-            self.close_csv()
+            self.end_recording()
             instruments.close()
             self.events.put(("stopped", None))
 
@@ -209,8 +296,15 @@ class Acquisition(threading.Thread):
                 started = True
                 self.events.put(("recording", arg))
             elif command == "stop_record":
-                self.close_csv()
+                self.end_recording()
                 self.events.put(("recording", None))
+
+    def end_recording(self):
+        #close the CSV and re-arm the camera trigger, if a recording was running
+        if self.csv_file is None:
+            return
+        self.close_csv()
+        self.instruments.reset_camera(self.log)
 
     def close_csv(self):
         if self.csv_file is not None:
@@ -227,6 +321,7 @@ class App:
         self.recording_path = None
         self.rows_recorded = 0
         self.auto_name = default_file_name()
+        self.camera_triggered = False
 
         root.title("Voltage / Pressure Data Collector")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -308,8 +403,9 @@ class App:
         if output_file is None:
             return
         if self.acquisition is None: #recording needs live sampling, so start it too
-            self.start_acquisition()
-        self.acquisition.commands.put(("record", output_file))
+            self.start_acquisition(record_file=output_file)
+        else:
+            self.acquisition.commands.put(("record", output_file))
         self.record_button.config(state="disabled")
         self.set_save_inputs("disabled")
 
@@ -326,8 +422,10 @@ class App:
             return None
         return output_file
 
-    def start_acquisition(self):
-        self.acquisition = Acquisition(self.events)
+    def start_acquisition(self, record_file=None):
+        self.acquisition = Acquisition(self.events, trigger_camera=not self.camera_triggered)
+        if record_file is not None: #queue before the thread starts so the very first sample is recorded (and triggers the camera)
+            self.acquisition.commands.put(("record", record_file))
         self.acquisition.start()
         self.display_button.config(text="Stop display")
         self.status_var.set("Connecting…")
@@ -357,6 +455,9 @@ class App:
                 self.log("Instruments connected")
             elif event == "recording":
                 self.on_recording_changed(arg)
+            elif event == "camera_triggered":
+                self.camera_triggered = True
+                self.log("Camera triggered")
             elif event == "stopped":
                 self.on_stopped()
         self.root.after(100, self.poll_events)
