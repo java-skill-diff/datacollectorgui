@@ -23,6 +23,7 @@ COMMAND_PRESSURE = "#01RD\r" #01 (ID) ReaD \r (carraige return)
 COMMAND_RFPOWER = "Q\r"
 COMMAND_SETTOSERIAL = "***\r" #Set Seren R301 to serial mode for reading forward and reflected power
 COMMAND_STOP = "S\r"
+COMMAND_GO = "G\r" #run the R301's programmed routine
 
 PRESSURE_PORT = 'COM2'
 RF_PORT = 'COM4'
@@ -138,6 +139,22 @@ class Instruments:
             log(f"WARNING: Camera trigger failed. Code: {e}")
             return False
 
+    def start_rf_routine(self, log):
+        #returns True if the go command was sent
+        try:
+            self.ser_rfpower.write(COMMAND_GO.encode('utf-8'))
+            return True
+        except serial.SerialException as e:
+            log(f"WARNING: Could not send go to RF power supply. Code: {e}")
+            return False
+
+    def stop_rf_routine(self, log):
+        try:
+            self.ser_rfpower.write(COMMAND_STOP.encode('utf-8'))
+            log("RF routine stopped")
+        except serial.SerialException as e:
+            log(f"WARNING: Could not send stop to RF power supply. Code: {e}")
+
     def camera_reply(self):
         try:
             return self.ser_camera.readline().decode('utf-8', errors='replace').strip()
@@ -196,11 +213,10 @@ class Instruments:
                 raise ValueError(f"unexpected response {raw_response!r}")
             forward_power_w = int(fields[2])
             reflected_power_w = int(fields[3])
-        except Exception as e:
+        except Exception as e: #a bad reading is recorded as "NA"; the R301 is left running so a programmed routine isn't cut short
             log(f"Error occurred at RF: {e}")
             forward_power_w = "NA"
             reflected_power_w = "NA"
-            quietly(lambda: self.ser_rfpower.write(COMMAND_STOP.encode('utf-8'))) #Stop the R301 from running
 
         return {
             "rough_pressure_pa": rough_valuetorr * TORR_TO_PA if rough_valuetorr != "NA" else "NA", #Pascal - ROUGH
@@ -213,7 +229,7 @@ class Instruments:
 
 class Acquisition(threading.Thread):
     #Runs the sampling loop off the GUI thread. Talks to the GUI only through queues, since tkinter isn't thread-safe:
-    #  commands (GUI -> worker): ("record", path), ("stop_record", None)
+    #  commands (GUI -> worker): ("record", (path, send_rf_go)), ("stop_record", None)
     #  events (worker -> GUI): ("log", msg), ("connected", None), ("sample", dict), ("recording", path or None),
     #                          ("camera_triggered", None), ("stopped", None)
 
@@ -226,6 +242,8 @@ class Acquisition(threading.Thread):
         self.stop_event = threading.Event()
         self.csv_file = None
         self.csv_writer = None
+        self.send_rf_go = False #send G at the start of the recording just opened
+        self.rf_running = False #G was sent for the current recording, so stop the RF when it ends
 
     def log(self, msg):
         self.events.put(("log", msg))
@@ -243,8 +261,12 @@ class Acquisition(threading.Thread):
                 if self.handle_commands(): #recording just started: restart the clock so the CSV starts at t=0
                     if self.trigger_camera:
                         camera_sent = instruments.trigger_camera(self.log) #sent right before t=0 so the video lines up with the first datapoint
+                    if self.send_rf_go:
+                        self.rf_running = instruments.start_rf_routine(self.log) #also right before t=0, so the routine starts with the data
                     acquisition_start = now_s()
                     i = 0
+                    if self.rf_running:
+                        self.log("RF routine started")
                 elapsed_s = now_s() - acquisition_start
 
                 sample = instruments.read(self.log)
@@ -282,29 +304,31 @@ class Acquisition(threading.Thread):
                 return started
 
             if command == "record":
+                path, self.send_rf_go = arg
                 self.close_csv()
                 try:
-                    self.csv_file = open(arg, "w", newline="")
+                    self.csv_file = open(path, "w", newline="")
                 except OSError as e:
-                    self.log(f"Could not open {arg}: {e}")
+                    self.log(f"Could not open {path}: {e}")
                     self.events.put(("recording", None))
                     continue
                 self.csv_writer = csv.writer(self.csv_file)
                 self.csv_writer.writerow(CSV_HEADER)
-                #if RF ready - enable to start the R301 with the recording
-                #    self.ser_rfpower.write("G\r".encode('utf-8'))
                 started = True
-                self.events.put(("recording", arg))
+                self.events.put(("recording", path))
             elif command == "stop_record":
                 self.end_recording()
                 self.events.put(("recording", None))
 
     def end_recording(self):
-        #close the CSV and re-arm the camera trigger, if a recording was running
+        #close the CSV, re-arm the camera trigger and stop the RF routine, if a recording was running
         if self.csv_file is None:
             return
         self.close_csv()
         self.instruments.reset_camera(self.log)
+        if self.rf_running:
+            self.rf_running = False
+            self.instruments.stop_rf_routine(self.log)
 
     def close_csv(self):
         if self.csv_file is not None:
@@ -355,8 +379,12 @@ class App:
         self.display_button.grid(row=0, column=0, padx=(0, 10))
         self.record_button = ttk.Button(control_frame, text="Start recording", width=18, command=self.toggle_recording)
         self.record_button.grid(row=0, column=1, padx=(0, 10))
+        self.rf_go_var = tk.BooleanVar(value=False) #send G to the R301 when recording starts
+        self.rf_go_button = ttk.Checkbutton(control_frame, variable=self.rf_go_var, style="Toolbutton", width=18, command=self.update_rf_go_button)
+        self.rf_go_button.grid(row=0, column=2, padx=(0, 10))
+        self.update_rf_go_button()
         self.status_var = tk.StringVar(value="Idle")
-        ttk.Label(control_frame, textvariable=self.status_var).grid(row=0, column=2, sticky="w")
+        ttk.Label(control_frame, textvariable=self.status_var).grid(row=0, column=3, sticky="w")
 
         #live data boxes
         data_frame = ttk.Frame(main)
@@ -384,6 +412,9 @@ class App:
         if chosen:
             self.dir_var.set(chosen)
 
+    def update_rf_go_button(self):
+        self.rf_go_button.config(text="RF routine: ON" if self.rf_go_var.get() else "RF routine: OFF")
+
     def toggle_display(self):
         if self.acquisition is None:
             self.start_acquisition()
@@ -402,10 +433,11 @@ class App:
         output_file = self.output_file()
         if output_file is None:
             return
+        record = (output_file, self.rf_go_var.get())
         if self.acquisition is None: #recording needs live sampling, so start it too
-            self.start_acquisition(record_file=output_file)
+            self.start_acquisition(record=record)
         else:
-            self.acquisition.commands.put(("record", output_file))
+            self.acquisition.commands.put(("record", record))
         self.record_button.config(state="disabled")
         self.set_save_inputs("disabled")
 
@@ -422,10 +454,10 @@ class App:
             return None
         return output_file
 
-    def start_acquisition(self, record_file=None):
+    def start_acquisition(self, record=None):
         self.acquisition = Acquisition(self.events, trigger_camera=not self.camera_triggered)
-        if record_file is not None: #queue before the thread starts so the very first sample is recorded (and triggers the camera)
-            self.acquisition.commands.put(("record", record_file))
+        if record is not None: #queue before the thread starts so the very first sample is recorded (and triggers the camera)
+            self.acquisition.commands.put(("record", record))
         self.acquisition.start()
         self.display_button.config(text="Stop display")
         self.status_var.set("Connecting…")
@@ -498,7 +530,7 @@ class App:
         self.log("Acquisition stopped")
 
     def set_save_inputs(self, state):
-        for widget in (self.dir_entry, self.name_entry, self.browse_button):
+        for widget in (self.dir_entry, self.name_entry, self.browse_button, self.rf_go_button): #locked while recording; they only apply at the start
             widget.config(state=state)
 
     def log(self, msg):
