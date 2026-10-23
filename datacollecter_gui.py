@@ -20,7 +20,7 @@ TORR_TO_PA = 133.3223684211
 DEFAULT_DIR = "./data_output"
 
 COMMAND_PRESSURE = "#01RD\r" #01 (ID) ReaD \r (carraige return)
-COMMAND_RFPOWER = "Q\r"
+COMMAND_RFPOWER = "Q\r" #Query. 
 COMMAND_SETTOSERIAL = "***\r" #Set Seren R301 to serial mode for reading forward and reflected power
 COMMAND_STOP = "S\r"
 COMMAND_GO = "G\r" #run the R301's programmed routine
