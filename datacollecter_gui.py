@@ -2,6 +2,7 @@ from time import perf_counter_ns, time
 import csv
 import pathlib
 import queue
+import shutil
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -18,6 +19,9 @@ SAMPLE_INTERVAL_S = 1.0
 SPIN_MARGIN_S = 0.02 #busy-wait this long before each deadline; must exceed OS sleep granularity (~15.6ms on Windows)
 TORR_TO_PA = 133.3223684211
 DEFAULT_DIR = "./data_output"
+STATUS_COLOR_RECORDING = "#d32f2f" #red
+STATUS_COLOR_DISPLAYING = "#2e7d32" #green
+STATUS_COLOR_IDLE = "#f9a825" #yellow
 
 COMMAND_PRESSURE = "#01RD\r" #01 (ID) ReaD \r (carraige return)
 COMMAND_RFPOWER = "Q\r" #Query. 
@@ -27,7 +31,7 @@ COMMAND_GO = "G\r" #run the R301's programmed routine
 
 PRESSURE_PORT = 'COM2'
 RF_PORT = 'COM4'
-CAMERA_PORT = None #Arduino camera trigger (camera_trigger.ino); None = auto-detect, or set e.g. 'COM5'
+CAMERA_PORT = 'COM5' #Arduino camera trigger (camera_trigger.ino); None = auto-detect, or set e.g. 'COM5' - HARDCODED TO COM5, detection does not work. 
 CAMERA_BAUD = 115200
 CAMERA_READY_TIMEOUT_S = 3.0 #the Arduino resets when the port opens; bootloader + setup() takes ~2 s
 COMMAND_CAMERA_TRIGGER = "T\r" #fire the camera trigger (only fires once until re-armed)
@@ -337,6 +341,72 @@ class Acquisition(threading.Thread):
         self.csv_writer = None
 
 
+class TransferDialog:
+    #Pop-up shown when a recording ends: move the finished CSV from where it was recorded to a chosen folder
+    def __init__(self, parent, path, initial_dir, log):
+        self.path = path
+        self.log = log
+        self.moved_to_dir = None #set to the destination folder if the file was moved
+
+        self.top = tk.Toplevel(parent)
+        self.top.title("Transfer recording")
+        self.top.transient(parent)
+        self.top.resizable(True, False)
+        self.top.protocol("WM_DELETE_WINDOW", self.top.destroy)
+        frame = ttk.Frame(self.top, padding=10)
+        frame.grid(sticky="nsew")
+        self.top.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text="Recording saved to:").grid(row=0, column=0, sticky="w")
+        ttk.Label(frame, text=str(path.resolve())).grid(row=0, column=1, columnspan=2, sticky="w", padx=5)
+        ttk.Label(frame, text="Move to:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.dest_var = tk.StringVar(value=initial_dir)
+        dest_entry = ttk.Entry(frame, textvariable=self.dest_var, width=50)
+        dest_entry.grid(row=1, column=1, sticky="ew", padx=5, pady=(8, 0))
+        ttk.Button(frame, text="Browse…", command=self.browse).grid(row=1, column=2, pady=(8, 0))
+
+        button_frame = ttk.Frame(frame)
+        button_frame.grid(row=2, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        ttk.Button(button_frame, text="Keep here", command=self.top.destroy).grid(row=0, column=0, padx=(0, 5))
+        ttk.Button(button_frame, text="Move file", command=self.move).grid(row=0, column=1)
+
+        dest_entry.focus_set()
+        self.top.grab_set() #modal, so a new recording can't start (and reuse the name) before the file is moved
+        parent.wait_window(self.top)
+
+    def browse(self):
+        chosen = filedialog.askdirectory(parent=self.top, initialdir=self.dest_var.get() or str(self.path.parent))
+        if chosen:
+            self.dest_var.set(chosen)
+
+    def move(self):
+        dest_text = self.dest_var.get().strip()
+        if not dest_text:
+            messagebox.showerror("Transfer recording", "Choose a destination folder.", parent=self.top)
+            return
+        dest_dir = pathlib.Path(dest_text)
+        dest = dest_dir / self.path.name
+        if dest.resolve() == self.path.resolve(): #already there, nothing to move
+            self.top.destroy()
+            return
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("Transfer recording", f"Could not create {dest_dir}:\n{e}", parent=self.top)
+            return
+        if dest.exists() and not messagebox.askyesno("Overwrite?", f"{dest} already exists. Overwrite it?", parent=self.top):
+            return
+        try:
+            shutil.move(str(self.path), str(dest))
+        except OSError as e:
+            messagebox.showerror("Transfer recording", f"Could not move {self.path.name}:\n{e}", parent=self.top)
+            return
+        self.log(f"Moved {self.path.name} to {dest}")
+        self.moved_to_dir = str(dest_dir)
+        self.top.destroy()
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -346,6 +416,7 @@ class App:
         self.rows_recorded = 0
         self.auto_name = default_file_name()
         self.camera_triggered = False
+        self.transfer_dir = "" #last folder a recording was moved to, offered again in the next transfer pop-up
 
         root.title("Voltage / Pressure Data Collector")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -383,8 +454,11 @@ class App:
         self.rf_go_button = ttk.Checkbutton(control_frame, variable=self.rf_go_var, style="Toolbutton", width=18, command=self.update_rf_go_button)
         self.rf_go_button.grid(row=0, column=2, padx=(0, 10))
         self.update_rf_go_button()
-        self.status_var = tk.StringVar(value="Idle")
-        ttk.Label(control_frame, textvariable=self.status_var).grid(row=0, column=3, sticky="w")
+        self.status_var = tk.StringVar()
+        self.status_border = tk.Frame(control_frame, padx=3, pady=3) #background shows as a colored border around the label
+        self.status_border.grid(row=0, column=3, sticky="w")
+        ttk.Label(self.status_border, textvariable=self.status_var, padding=(6, 2)).pack()
+        self.set_status("Idle")
 
         #live data boxes
         data_frame = ttk.Frame(main)
@@ -422,7 +496,7 @@ class App:
             self.acquisition.stop_event.set()
             self.display_button.config(state="disabled")
             self.record_button.config(state="disabled")
-            self.status_var.set("Stopping…")
+            self.set_status("Stopping…")
 
     def toggle_recording(self):
         if self.recording_path is not None:
@@ -460,7 +534,7 @@ class App:
             self.acquisition.commands.put(("record", record))
         self.acquisition.start()
         self.display_button.config(text="Stop display")
-        self.status_var.set("Connecting…")
+        self.set_status("Connecting…")
 
     def on_close(self):
         if self.acquisition is not None:
@@ -483,7 +557,7 @@ class App:
             elif event == "log":
                 self.log(arg)
             elif event == "connected":
-                self.status_var.set("Displaying")
+                self.set_status("Displaying")
                 self.log("Instruments connected")
             elif event == "recording":
                 self.on_recording_changed(arg)
@@ -500,7 +574,7 @@ class App:
             self.value_vars[key].set(value if value == "NA" else fmt.format(value))
         if self.recording_path is not None:
             self.rows_recorded += 1
-            self.status_var.set(f"Recording to {self.recording_path.name} ({self.rows_recorded} samples)")
+            self.set_status(f"Recording to {self.recording_path.name} ({self.rows_recorded} samples)")
 
     def on_recording_changed(self, path):
         self.record_button.config(state="normal")
@@ -508,26 +582,45 @@ class App:
             self.recording_path = path
             self.rows_recorded = 0
             self.record_button.config(text="Stop recording")
-            self.status_var.set(f"Recording to {path.name}")
+            self.set_status(f"Recording to {path.name}")
             self.log(f"Recording to {path}")
             return
-        if self.recording_path is not None:
-            self.log(f"Saved {self.rows_recorded} samples to {self.recording_path}")
+        finished_path = self.recording_path
+        if finished_path is not None:
+            self.log(f"Saved {self.rows_recorded} samples to {finished_path}")
         self.recording_path = None
         self.record_button.config(text="Start recording")
         self.set_save_inputs("normal")
         if self.acquisition is not None:
-            self.status_var.set("Displaying")
+            self.set_status("Displaying")
         if self.name_var.get() == self.auto_name: #fresh default name so the next recording doesn't overwrite this one
             self.auto_name = default_file_name()
             self.name_var.set(self.auto_name)
+        if finished_path is not None and finished_path.exists(): #worker has already closed the CSV, so it's safe to move
+            self.root.after_idle(lambda: self.offer_transfer(finished_path))
+
+    def offer_transfer(self, path):
+        dialog = TransferDialog(self.root, path, self.transfer_dir, self.log)
+        if dialog.moved_to_dir is not None:
+            self.transfer_dir = dialog.moved_to_dir
 
     def on_stopped(self):
         self.acquisition = None
         self.on_recording_changed(None) #worker closes any open CSV on stop
         self.display_button.config(text="Start display", state="normal")
-        self.status_var.set("Idle")
+        self.set_status("Idle")
         self.log("Acquisition stopped")
+
+    def set_status(self, text):
+        #border color follows the actual state: red while recording, green while displaying, yellow when idle
+        if self.recording_path is not None:
+            color = STATUS_COLOR_RECORDING
+        elif self.acquisition is not None:
+            color = STATUS_COLOR_DISPLAYING
+        else:
+            color = STATUS_COLOR_IDLE
+        self.status_var.set(text)
+        self.status_border.config(bg=color)
 
     def set_save_inputs(self, state):
         for widget in (self.dir_entry, self.name_entry, self.browse_button, self.rf_go_button): #locked while recording; they only apply at the start
