@@ -50,10 +50,12 @@ CSV_HEADER = [key for key, _, _, _ in PARAMETERS]
 
 
 def now_s():
+    #current time in seconds from the high-resolution performance counter
     return perf_counter_ns() / 1e9
 
 
 def sleep_until(target_s, stop_event):
+    #wait until target_s (perf-counter seconds), returning early if stop_event is set
     #sleep() can overshoot by a full OS timer tick, so sleep until just before the target, then spin to hit it exactly
     #stop_event.wait() is used instead of sleep() so a stop request wakes the loop immediately
     remaining = target_s - now_s()
@@ -64,11 +66,12 @@ def sleep_until(target_s, stop_event):
 
 
 def default_file_name():
+    #default CSV name, made unique with the current Unix timestamp
     return f"voltage_pressure_run_{int(time())}"
 
 
 def find_camera_port():
-    #first port that looks like an Arduino, skipping the ports used by the other instruments
+    #return the first port that looks like an Arduino, skipping the ports used by the other instruments; None if there isn't one
     for p in list_ports.comports():
         if p.device in (PRESSURE_PORT, RF_PORT):
             continue
@@ -87,7 +90,9 @@ def quietly(fn):
 
 
 class Instruments:
+    #connections to every instrument, plus the commands and reads sent to them
     def __init__(self):
+        #start with nothing connected; open() fills these in
         self.task = None
         self.ser_pressure = None
         self.ser_rfpower = None
@@ -96,6 +101,7 @@ class Instruments:
         self.ser_camera = None
 
     def open(self, log):
+        #connect to the DAQ, rough pressure gauge, RF generator, voltmeter and camera trigger
         #open nidaqmx analog channels
         self.task = nidaqmx.task.Task()
         self.task.ai_channels.add_ai_voltage_chan("Dev1/ai0", terminal_config=nidaqmx.constants.TerminalConfiguration.RSE)
@@ -112,6 +118,7 @@ class Instruments:
         self.open_camera(log)
 
     def open_camera(self, log):
+        #connect to the Arduino camera trigger and wait for its READY message
         #the camera trigger is optional: if it can't be opened, data collection still runs without it
         port = CAMERA_PORT or find_camera_port()
         if port is None:
@@ -132,6 +139,7 @@ class Instruments:
         log(f"Camera trigger connected on {port}")
 
     def trigger_camera(self, log):
+        #send T to fire the camera trigger
         #returns True if the trigger command was sent; the reply is checked later by camera_reply() so the first sample isn't delayed
         if self.ser_camera is None:
             return False
@@ -144,7 +152,7 @@ class Instruments:
             return False
 
     def start_rf_routine(self, log):
-        #returns True if the go command was sent
+        #send G to start the R301's programmed RF routine; returns True if it was sent
         try:
             self.ser_rfpower.write(COMMAND_GO.encode('utf-8'))
             return True
@@ -153,6 +161,7 @@ class Instruments:
             return False
 
     def stop_rf_routine(self, log):
+        #send S to stop the R301's RF routine
         try:
             self.ser_rfpower.write(COMMAND_STOP.encode('utf-8'))
             log("RF routine stopped")
@@ -160,12 +169,14 @@ class Instruments:
             log(f"WARNING: Could not send stop to RF power supply. Code: {e}")
 
     def camera_reply(self):
+        #read the camera trigger's reply to T ("OK" if it fired), or an error string if the read fails
         try:
             return self.ser_camera.readline().decode('utf-8', errors='replace').strip()
         except serial.SerialException as e:
             return f"error: {e}"
 
     def reset_camera(self, log):
+        #send R to re-arm the camera trigger for the next recording
         if self.ser_camera is None:
             return
         try:
@@ -176,6 +187,7 @@ class Instruments:
             log(f"WARNING: Camera trigger reset failed. Code: {e}")
 
     def close(self):
+        #stop the R301 and close every instrument connection
         #only close what was actually opened, so a failed open() still cleans up
         if self.task is not None:
             quietly(self.task.close)
@@ -190,6 +202,7 @@ class Instruments:
             quietly(self.ser_camera.close)
 
     def read(self, log):
+        #take one reading from every instrument; returns {csv column: value} for all columns except time_s
         #DAQ and voltmeter failures raise and stop acquisition; pressure/RF failures are logged and recorded as "NA"
         pressure_voltage_direct = self.task.read()
         if isinstance(pressure_voltage_direct, (list, tuple)): #task.read() can return a list; take the single sample
@@ -238,6 +251,7 @@ class Acquisition(threading.Thread):
     #                          ("camera_triggered", None), ("stopped", None)
 
     def __init__(self, events, trigger_camera):
+        #set up the worker; events is the queue to the GUI, trigger_camera says whether to fire the camera on the next recording
         super().__init__(daemon=True)
         self.events = events
         self.trigger_camera = trigger_camera #send T at the first sample of the next recording (the camera is only triggered once per program run)
@@ -250,9 +264,11 @@ class Acquisition(threading.Thread):
         self.rf_running = False #G was sent for the current recording, so stop the RF when it ends
 
     def log(self, msg):
+        #send a log message to the GUI
         self.events.put(("log", msg))
 
     def run(self):
+        #thread body: open the instruments, sample every SAMPLE_INTERVAL_S until stopped, then clean up
         instruments = self.instruments
         try:
             instruments.open(self.log)
@@ -299,7 +315,7 @@ class Acquisition(threading.Thread):
             self.events.put(("stopped", None))
 
     def handle_commands(self):
-        #returns True if a new recording was started
+        #process every pending GUI command (start/stop recording); returns True if a new recording was started
         started = False
         while True:
             try:
@@ -335,6 +351,7 @@ class Acquisition(threading.Thread):
             self.instruments.stop_rf_routine(self.log)
 
     def close_csv(self):
+        #close the CSV file, if one is open, and drop its writer
         if self.csv_file is not None:
             quietly(self.csv_file.close)
         self.csv_file = None
@@ -344,6 +361,7 @@ class Acquisition(threading.Thread):
 class TransferDialog:
     #Pop-up shown when a recording ends: move the finished CSV from where it was recorded to a chosen folder
     def __init__(self, parent, path, initial_dir, log):
+        #build the pop-up and block until it is closed
         self.path = path
         self.log = log
         self.moved_to_dir = None #set to the destination folder if the file was moved
@@ -376,11 +394,13 @@ class TransferDialog:
         parent.wait_window(self.top)
 
     def browse(self):
+        #choose the destination folder with a folder picker
         chosen = filedialog.askdirectory(parent=self.top, initialdir=self.dest_var.get() or str(self.path.parent))
         if chosen:
             self.dest_var.set(chosen)
 
     def move(self):
+        #move the CSV into the chosen folder and close the pop-up; on an error, show it and keep the pop-up open
         dest_text = self.dest_var.get().strip()
         if not dest_text:
             messagebox.showerror("Transfer recording", "Choose a destination folder.", parent=self.top)
@@ -408,7 +428,9 @@ class TransferDialog:
 
 
 class App:
+    #main window: save location, controls, live readings and log. Runs on the GUI thread and drives an Acquisition worker
     def __init__(self, root):
+        #build the window and start polling for worker events
         self.root = root
         self.events = queue.Queue()
         self.acquisition = None
@@ -482,14 +504,17 @@ class App:
     #---- button handlers ----
 
     def browse_dir(self):
+        #choose the recording folder with a folder picker
         chosen = filedialog.askdirectory(initialdir=self.dir_var.get() or ".")
         if chosen:
             self.dir_var.set(chosen)
 
     def update_rf_go_button(self):
+        #show the RF routine toggle's state in its label
         self.rf_go_button.config(text="RF routine: ON" if self.rf_go_var.get() else "RF routine: OFF")
 
     def toggle_display(self):
+        #Start/Stop display button: start live sampling, or ask the worker to stop
         if self.acquisition is None:
             self.start_acquisition()
         else:
@@ -499,6 +524,7 @@ class App:
             self.set_status("Stopping…")
 
     def toggle_recording(self):
+        #Start/Stop recording button: stop the current recording, or start one (starting live sampling if needed)
         if self.recording_path is not None:
             self.acquisition.commands.put(("stop_record", None))
             self.record_button.config(state="disabled")
@@ -516,6 +542,7 @@ class App:
         self.set_save_inputs("disabled")
 
     def output_file(self):
+        #build the CSV path from the save inputs and create its folder; returns None if that fails or the user won't overwrite an existing file
         output_dir = pathlib.Path(self.dir_var.get().strip() or DEFAULT_DIR)
         name = pathlib.Path(self.name_var.get().strip() or default_file_name()).stem
         try:
@@ -529,6 +556,7 @@ class App:
         return output_file
 
     def start_acquisition(self, record=None):
+        #start the worker thread, optionally recording from its first sample
         self.acquisition = Acquisition(self.events, trigger_camera=not self.camera_triggered)
         if record is not None: #queue before the thread starts so the very first sample is recorded (and triggers the camera)
             self.acquisition.commands.put(("record", record))
@@ -537,6 +565,7 @@ class App:
         self.set_status("Connecting…")
 
     def on_close(self):
+        #window close: stop the worker (asking first if recording) and exit
         if self.acquisition is not None:
             if self.recording_path is not None and not messagebox.askyesno("Quit", "Recording is in progress. Stop and quit?"):
                 return
@@ -547,6 +576,7 @@ class App:
     #---- worker events ----
 
     def poll_events(self):
+        #handle every event from the worker, then check again in 100 ms
         while True:
             try:
                 event, arg = self.events.get_nowait()
@@ -569,6 +599,7 @@ class App:
         self.root.after(100, self.poll_events)
 
     def show_sample(self, sample):
+        #update the live data boxes and the recording's sample count
         for key, _, _, fmt in PARAMETERS:
             value = sample[key]
             self.value_vars[key].set(value if value == "NA" else fmt.format(value))
@@ -577,6 +608,7 @@ class App:
             self.set_status(f"Recording to {self.recording_path.name} ({self.rows_recorded} samples)")
 
     def on_recording_changed(self, path):
+        #update the GUI when a recording starts (path) or ends (None); when one ends, offer to move its file
         self.record_button.config(state="normal")
         if path is not None:
             self.recording_path = path
@@ -600,11 +632,13 @@ class App:
             self.root.after_idle(lambda: self.offer_transfer(finished_path))
 
     def offer_transfer(self, path):
+        #show the transfer pop-up for a finished recording and remember the folder it was moved to
         dialog = TransferDialog(self.root, path, self.transfer_dir, self.log)
         if dialog.moved_to_dir is not None:
             self.transfer_dir = dialog.moved_to_dir
 
     def on_stopped(self):
+        #reset the GUI after the worker thread has stopped
         self.acquisition = None
         self.on_recording_changed(None) #worker closes any open CSV on stop
         self.display_button.config(text="Start display", state="normal")
@@ -612,7 +646,7 @@ class App:
         self.log("Acquisition stopped")
 
     def set_status(self, text):
-        #border color follows the actual state: red while recording, green while displaying, yellow when idle
+        #set the status text; the border color follows the actual state: red while recording, green while displaying, yellow when idle
         if self.recording_path is not None:
             color = STATUS_COLOR_RECORDING
         elif self.acquisition is not None:
@@ -623,10 +657,12 @@ class App:
         self.status_border.config(bg=color)
 
     def set_save_inputs(self, state):
+        #enable or disable the save location inputs and the RF routine toggle
         for widget in (self.dir_entry, self.name_entry, self.browse_button, self.rf_go_button): #locked while recording; they only apply at the start
             widget.config(state=state)
 
     def log(self, msg):
+        #append a line to the log panel
         self.log_text.config(state="normal")
         self.log_text.insert("end", msg + "\n")
         self.log_text.see("end")
